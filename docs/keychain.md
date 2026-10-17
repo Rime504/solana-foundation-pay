@@ -97,9 +97,11 @@ when the action moves no money. `kind` is one of `authorize_payment`,
 Exit status `0` approves. Anything else denies, and so does a program that
 cannot start, is killed, or does not answer within `timeout_secs` (it is
 then killed and reaped, along with any helpers it started on Unix; the
-timeout also covers delivering the request). The approver replaces the
-platform prompt only when the caller brings no gate of its own, it is only
-consulted when `auth_required` applies, and it lives in `accounts.yml` next to
+timeout also covers delivering the request). On Unix, anything the approver
+leaves running in its process group is killed once it answers, so it should
+hand longer work to a separate service. The approver replaces the platform
+prompt only when the caller brings no gate of its own, it is only consulted
+when `auth_required` applies, and it lives in `accounts.yml` next to
 `auth_required`, so it is never weaker than turning auth off. A minimal
 approver that approves single payments up to $1 and denies everything else:
 

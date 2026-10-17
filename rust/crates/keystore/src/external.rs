@@ -11,7 +11,9 @@
 //! killed by a signal or does not answer within the timeout is a denial. The
 //! timeout covers delivering the request as well as the answer, and a
 //! timed-out program is killed and reaped, along with any helpers it started
-//! on Unix, so it cannot keep a request open.
+//! on Unix, so it cannot keep a request open. On Unix the approver runs in
+//! its own process group, and once it answers, anything it left running in
+//! that group is killed too.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -120,8 +122,12 @@ impl ExternalApprover {
 
     fn wait_until(&self, child: &mut Child, deadline: Instant) -> Result<ExitStatus> {
         loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
+            if exited(child)? {
+                // The approver has answered. Stop what it left behind in its
+                // group, which may still hold the request pipe open and keep
+                // the writer thread blocked, then reap it.
+                kill_group(child);
+                return Ok(child.wait()?);
             }
             if Instant::now() >= deadline {
                 kill_tree(child);
@@ -136,16 +142,62 @@ impl ExternalApprover {
     }
 }
 
-/// Kill the approver and every process in its group, then reap it.
-fn kill_tree(child: &mut Child) {
+/// Whether the approver has exited. On Unix this leaves it unreaped, so its
+/// pid, and with it the id of the process group it leads, stays reserved
+/// until [`kill_group`] has run and we reap it.
+#[cfg(unix)]
+fn exited(child: &mut Child) -> std::io::Result<bool> {
+    let pid = libc::id_t::try_from(child.id()).map_err(std::io::Error::other)?;
+    // SAFETY: siginfo_t is plain data; all zeroes is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, writable siginfo_t for the whole call.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(err);
+    }
+    // With WNOHANG and nothing to report, si_pid keeps the zero we wrote.
+    // SAFETY: si_pid is either that zero or set by waitid for an exited child.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(not(unix))]
+fn exited(child: &mut Child) -> std::io::Result<bool> {
+    Ok(child.try_wait()?.is_some())
+}
+
+/// Kill every process in the approver's group (Unix only).
+///
+/// Only called while the approver is unreaped: an exited child stays a zombie
+/// until it is waited for, and a zombie keeps its pid, so the group id it
+/// leads cannot be handed to an unrelated process before this signal lands.
+/// A group whose leader we have already reaped is never signalled.
+fn kill_group(child: &Child) {
     #[cfg(unix)]
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: kill(2) takes no pointers. The child is not reaped yet, so
-        // its pid, and the process group it leads, cannot have been reused.
+        // SAFETY: kill(2) takes no pointers. See above for why the group id
+        // cannot have been reused.
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
     }
+    #[cfg(not(unix))]
+    let _ = child;
+}
+
+/// Kill the approver and every process in its group, then reap it.
+fn kill_tree(child: &mut Child) {
+    kill_group(child);
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -273,6 +325,28 @@ mod tests {
     }
 
     #[test]
+    fn answered_approver_leaves_no_helper_holding_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("helper-pid");
+        // The helper keeps the request pipe open without reading it (a
+        // background job's stdin is /dev/null, hence fd 3), and the approver
+        // approves at once, leaving the writer blocked on a full pipe.
+        let body = format!(
+            "exec 3<&0; sleep 30 <&3 3<&- & echo $! > {}; exit 0",
+            pid_file.display()
+        );
+        let approver = gate(script(&dir, "leaves.sh", &body), DEFAULT_APPROVER_TIMEOUT);
+
+        approver.run(vec![b'x'; 4 << 20]).unwrap();
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            gone(pid.trim()),
+            "helper left by an approver must be killed"
+        );
+    }
+
+    #[test]
     fn timeout_covers_a_request_the_approver_never_reads() {
         let dir = tempfile::tempdir().unwrap();
         // Holds stdin open and never reads it, so a large request fills the pipe.
@@ -299,18 +373,13 @@ mod tests {
         assert!(!marker.exists(), "approver must not start");
     }
 
-    /// Whether `pid` is gone within a couple of seconds. A killed helper is
-    /// reparented and reaped by init, which is not instant.
+    /// Whether `pid` has stopped within a couple of seconds. A killed helper
+    /// is reparented to init, which may reap it late or, in a container with
+    /// no reaping init, never; a zombie counts as stopped.
     fn gone(pid: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let alive = Command::new("kill")
-                .args(["-0", pid])
-                .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success();
-            if !alive {
+            if !running(pid) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -318,6 +387,29 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn running(pid: &str) -> bool {
+        // The state follows the command name, which ends at the last `)`.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, rest) = stat.rsplit_once(')')?;
+                rest.split_whitespace().next().map(|state| state != "Z")
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn running(pid: &str) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
     }
 
     #[test]
