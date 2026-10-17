@@ -48,9 +48,9 @@ hardware wallet is local but not exportable.
   `is_exportable()` first and returns one error for every non-exportable
   backend. `pay account export` and the export offer in `pay account destroy`
   both go through it.
-- **Approval.** `Gate::for_policy(auth_required, override)` picks the gate:
-  a caller-supplied override (MCP elicitation), else the platform prompt,
-  else nothing. `LocalKeystoreBackend::keystore` places it in front of the
+- **Approval.** `Gate::for_policy(auth_required, account.approval_override(override))`
+  picks the gate: a caller-supplied override (MCP elicitation), else the
+  account's external `approver`, else the platform prompt, else nothing. `LocalKeystoreBackend::keystore` places it in front of the
   secret store. The file backend composes the platform prompt itself; 1Password
   ignores the gate because `op` prompts.
 - **Platform `cfg`.** Only inside `backend/local.rs`, one block per store,
@@ -62,6 +62,52 @@ hardware wallet is local but not exportable.
   signer sources, and `Account::descriptor()` all resolve through it. Apple
   Keychain keeps `keychain` as its flag while its id and `accounts.yml` value
   stay `apple-keychain`.
+
+## External approvers (headless hosts)
+
+A host with no screen (CI, cron, a server agent) cannot show Touch ID,
+Windows Hello or polkit, so an `auth_required` account there can only fail.
+An account can name a program that approves instead:
+
+```yaml
+accounts:
+  mainnet:
+    agent:
+      keystore: file
+      path: ~/.config/pay/agent.json
+      auth_required: true
+      approver:
+        command: /usr/local/bin/pay-approver
+        args: ["--channel", "payments"]   # optional
+        timeout_secs: 120                 # optional, default 120
+```
+
+For every gated action pay runs the command and writes one JSON request to
+its stdin:
+
+```json
+{"version":1,"kind":"authorize_payment","message":"authorize payment of $0.05 for accessing API api.example.com","amount_minor_units":500,"moves_money":true,"recurring":false}
+```
+
+`amount_minor_units` is USD ten-thousandths (`$1` = `10000`) and is `null`
+when the action moves no money. `kind` is one of `authorize_payment`,
+`authorize_batch`, `create_account`, `import_account`, `export_account`,
+`delete_account`, `open_session`, `use_gateway_fee_payer`, `use_account`.
+
+Exit status `0` approves. Anything else denies, and so does a program that
+cannot start, is killed, or does not answer within `timeout_secs` (it is
+then killed and reaped). The approver replaces the platform prompt only when
+the caller brings no gate of its own, it is only consulted when
+`auth_required` applies, and it lives in `accounts.yml` next to
+`auth_required`, so it is never weaker than turning auth off. A minimal
+approver that approves single payments up to $1 and denies everything else:
+
+```sh
+#!/bin/sh
+req=$(cat)
+[ "$(printf '%s' "$req" | jq -r .kind)" = authorize_payment ] || exit 1
+[ "$(printf '%s' "$req" | jq -r '.amount_minor_units // 99999999')" -le 10000 ]
+```
 
 ## Adding a remote provider
 

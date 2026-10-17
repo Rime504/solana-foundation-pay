@@ -495,7 +495,10 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
         _ => {
             let local = crate::backend::local_by_kind(&account.backend)
                 .expect("descriptor resolved, so the kind is a registered local backend");
-            let gate = Gate::for_policy(account.auth_required_for_network(network), auth_override);
+            let gate = Gate::for_policy(
+                account.auth_required_for_network(network),
+                account.approval_override(auth_override),
+            );
             let file_path = account.file_path(name);
             let params = account.store_params(Some(&file_path));
             let ks = local.keystore(&params, gate)?;
@@ -911,6 +914,7 @@ mod tests {
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         };
 
         (temp_dir, account, keypair_bytes)
@@ -929,6 +933,7 @@ mod tests {
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         }
     }
 
@@ -1150,6 +1155,7 @@ mod tests {
             secret_key_b58: Some(bs58::encode(&full).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         }
     }
 
@@ -1166,6 +1172,7 @@ mod tests {
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         }
     }
 
@@ -1429,6 +1436,7 @@ mod tests {
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         };
 
         let err = signer_for_ephemeral_account(&account)
