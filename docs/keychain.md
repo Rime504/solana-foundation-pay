@@ -82,6 +82,16 @@ accounts:
         timeout_secs: 120                 # optional, default 120
 ```
 
+`command` must be an absolute path; a bare name such as `pay-approver` or a
+relative path is refused, since it would be resolved through the caller's
+`PATH` or working directory. The approver starts with a cleared environment
+and runs from `/`: it gets `PATH=/usr/bin:/bin`, `HOME` from the user
+database (not the caller's `HOME`), and `LANG` only when it is a plain locale
+name. Nothing else from pay's environment reaches it, so the caller's
+`LD_PRELOAD`, `PATH` or credentials held in environment variables cannot
+influence or leak into it. Refer to tools outside `/usr/bin:/bin` by absolute
+path, or set `PATH` inside the approver.
+
 For every gated action pay runs the command and writes one JSON request to
 its stdin:
 
@@ -112,6 +122,26 @@ req=$(cat)
 printf '%s' "$req" | jq -e '.recurring == false' >/dev/null || exit 1
 [ "$(printf '%s' "$req" | jq -r '.amount_minor_units // 99999999')" -le 10000 ]
 ```
+
+It expects `jq` in `/usr/bin`; where `jq` lives elsewhere (`/usr/local/bin`,
+Homebrew), use its absolute path. A missing `jq` makes every check fail, so
+the example then denies everything rather than approving.
+
+### Limits
+
+- **The boundary is the OS user.** The approver only constrains an agent that
+  runs as a different OS user from the one who owns `accounts.yml`, the
+  approver program and the key material. An agent running as the same user
+  can edit `accounts.yml` (or remove the approver), replace the approver
+  program, or read a file keystore directly. Run the agent as a separate user
+  or in a container that cannot write those files.
+- **An approval is not bound to the exact transaction.** The request
+  describes the action (kind, amount, whether it recurs), but carries no
+  recipient, mint or transaction digest, so the approver cannot check that
+  what is signed is exactly what it approved.
+- **`message` is partly built from what the paid server sends.** Treat it as
+  untrusted display text, especially when a person or a model reads it; base
+  decisions on `kind`, `amount_minor_units`, `moves_money` and `recurring`.
 
 ## Adding a remote provider
 

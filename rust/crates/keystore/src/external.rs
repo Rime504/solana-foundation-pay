@@ -15,8 +15,9 @@
 //! its own process group, and once it answers, anything it left running in
 //! that group is killed too.
 
+use std::ffi::OsString;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,14 @@ impl ExternalApprover {
 
     /// Run the approver on `request` and decide from its exit status.
     fn run(&self, request: Vec<u8>) -> Result<()> {
+        // A bare or relative name would be resolved through the caller's
+        // `PATH` or working directory, which the caller controls.
+        if !self.program.is_absolute() {
+            return Err(Error::AuthDenied(format!(
+                "approver `{}` must be an absolute path",
+                self.name()
+            )));
+        }
         // Checked before spawning, so a timeout too large to represent never
         // starts a program it could not bound.
         let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
@@ -77,8 +86,13 @@ impl ExternalApprover {
         })?;
 
         let mut command = Command::new(&self.program);
+        // None of the caller's environment (`LD_PRELOAD`, `PATH`, secrets)
+        // and none of its working directory reach the approver.
         command
             .args(&self.args)
+            .env_clear()
+            .envs(approver_env())
+            .current_dir("/")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
@@ -139,6 +153,79 @@ impl ExternalApprover {
             }
             std::thread::sleep(POLL_INTERVAL);
         }
+    }
+}
+
+/// `PATH` for the approver: fixed, never the caller's.
+#[cfg(unix)]
+pub const APPROVER_PATH: &str = "/usr/bin:/bin";
+
+/// The whole environment the approver starts with. Nothing comes from the
+/// caller unchecked: `PATH` is fixed, `HOME` comes from the user database
+/// rather than the caller's `HOME`, and `LANG` passes only as a plain locale
+/// name, since glibc reads a name with a `/` as a path to locale data.
+fn approver_env() -> Vec<(&'static str, OsString)> {
+    let mut env = Vec::new();
+    #[cfg(unix)]
+    {
+        env.push(("PATH", OsString::from(APPROVER_PATH)));
+        if let Some(home) = user_home() {
+            env.push(("HOME", home));
+        }
+    }
+    // Windows programs commonly fail to start without it.
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        env.push(("SystemRoot", root));
+    }
+    if let Some(lang) = std::env::var("LANG").ok().filter(|l| is_plain_locale(l)) {
+        env.push(("LANG", OsString::from(lang)));
+    }
+    env
+}
+
+/// A locale name such as `en_US.UTF-8` or `C.UTF-8`: no path separators,
+/// nothing that could name a file.
+fn is_plain_locale(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'))
+}
+
+/// The effective user's home directory from the user database.
+#[cfg(unix)]
+fn user_home() -> Option<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: passwd is plain data; all zeroes is a valid value.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer is valid for the call, and `buf.len()` is the
+        // size of the buffer `getpwuid_r` may write strings into.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: on success `pw_dir` points at a NUL-terminated string in `buf`.
+        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+        return Some(std::ffi::OsStr::from_bytes(dir.to_bytes()).to_owned());
     }
 }
 
@@ -208,7 +295,7 @@ impl AuthGate for ExternalApprover {
     }
 
     fn is_available(&self) -> bool {
-        resolve_program(&self.program).is_some()
+        self.program.is_absolute() && self.program.is_file()
     }
 }
 
@@ -224,19 +311,6 @@ fn intent_kind(intent: &AuthIntent) -> &'static str {
         AuthIntent::UseGatewayFeePayer(_) => "use_gateway_fee_payer",
         AuthIntent::UseAccount(_) => "use_account",
     }
-}
-
-/// The program as it would be run: a path with a separator is taken as is,
-/// a bare name is looked up on `PATH`.
-fn resolve_program(program: &Path) -> Option<PathBuf> {
-    if program.components().count() > 1 {
-        return program.is_file().then(|| program.to_path_buf());
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(program))
-            .find(|candidate| candidate.is_file())
-    })
 }
 
 #[cfg(all(test, unix))]
@@ -421,6 +495,122 @@ mod tests {
         assert!(!approver.is_available());
         let err = approver.authenticate(&payment()).unwrap_err();
         assert!(matches!(err, Error::AuthDenied(m) if m.contains("could not start")));
+    }
+
+    #[test]
+    fn bare_or_relative_command_is_refused() {
+        for program in ["sh", "pay-approver", "./approve", "bin/approve"] {
+            let approver = gate(PathBuf::from(program), DEFAULT_APPROVER_TIMEOUT);
+            assert!(!approver.is_available(), "{program} must be unavailable");
+            let err = approver.authenticate(&payment()).unwrap_err();
+            assert!(
+                matches!(&err, Error::AuthDenied(m) if m.contains("must be an absolute path")),
+                "{program}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_locale_names_pass_and_paths_do_not() {
+        for ok in [
+            "C",
+            "C.UTF-8",
+            "en_US.UTF-8",
+            "de_DE@euro",
+            "sr_RS.UTF-8@latin",
+        ] {
+            assert!(is_plain_locale(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/tmp/evil",
+            "../../tmp/evil",
+            "..",
+            ".hidden",
+            "en US",
+            "a/b",
+        ] {
+            assert!(!is_plain_locale(bad), "{bad:?}");
+        }
+    }
+
+    /// Set by [`caller_environment_never_reaches_the_approver`] when it
+    /// re-runs this test binary with a hostile environment.
+    const PROBE_OUT: &str = "PAY_APPROVER_TEST_PROBE_OUT";
+
+    #[test]
+    fn caller_environment_never_reaches_the_approver() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let planted = dir.path().join("planted");
+        std::fs::create_dir(&planted).unwrap();
+
+        // Run the probe in a fresh process, so the hostile environment never
+        // touches this one (setting variables in a threaded test is unsound).
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "external::tests::env_probe",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(PROBE_OUT, &out)
+            .env("LD_PRELOAD", "/nonexistent/evil.so")
+            .env("DYLD_INSERT_LIBRARIES", "/nonexistent/evil.dylib")
+            .env("PATH", format!("{}:/usr/bin:/bin", planted.display()))
+            .env("HOME", &planted)
+            .env("LANG", "/tmp/evil-locale")
+            .env("PAY_TEST_REMOTE_WALLET_SECRET", "hunter2")
+            .current_dir(&planted)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "probe failed");
+
+        let seen = std::fs::read_to_string(&out).unwrap();
+        let var = |name: &str| {
+            seen.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}=")))
+                .map(str::to_owned)
+        };
+        for name in [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "PAY_TEST_REMOTE_WALLET_SECRET",
+        ] {
+            assert_eq!(var(name), None, "{name} reached the approver");
+        }
+        assert!(
+            !seen.contains("hunter2"),
+            "secret value reached the approver"
+        );
+        assert_eq!(var("PATH").as_deref(), Some(APPROVER_PATH));
+        assert_eq!(var("LANG"), None, "a path-like LANG must not pass");
+        assert_ne!(
+            var("HOME").as_deref(),
+            Some(planted.to_str().unwrap()),
+            "HOME must come from the user database, not the caller"
+        );
+        assert_eq!(var("CWD").as_deref(), Some("/"), "approver must run from /");
+    }
+
+    /// The approver half of [`caller_environment_never_reaches_the_approver`];
+    /// does nothing when run on its own.
+    #[test]
+    #[ignore = "run by caller_environment_never_reaches_the_approver"]
+    fn env_probe() {
+        let Some(out) = std::env::var_os(PROBE_OUT) else {
+            return;
+        };
+        let out = PathBuf::from(out);
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "env > '{0}'; echo \"CWD=$(pwd)\" >> '{0}'; exit 0",
+            out.display()
+        );
+        let approver = gate(script(&dir, "probe.sh", &body), DEFAULT_APPROVER_TIMEOUT);
+        approver.authenticate(&payment()).unwrap();
     }
 
     #[test]
