@@ -891,6 +891,23 @@ mod tests {
         }
     }
 
+    /// A caller gate that always says yes, like an MCP client approving its
+    /// own elicitation.
+    struct AllowAuth;
+
+    impl AuthGate for AllowAuth {
+        fn authenticate(
+            &self,
+            _intent: &AuthIntent,
+        ) -> std::result::Result<(), crate::keystore::Error> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
     fn fresh_file_account(auth_required: Option<bool>) -> (tempfile::TempDir, Account, Vec<u8>) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let verifying_key = signing_key.verifying_key();
@@ -1100,6 +1117,43 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, Error::PaymentRejected(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_account_approver_must_approve_even_when_the_caller_does() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp_dir, mut account, expected) = fresh_file_account(Some(true));
+        let script = temp_dir.path().join("approve.sh");
+        let write_approver = |code: u8| {
+            std::fs::write(&script, format!("#!/bin/sh\ncat >/dev/null\nexit {code}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        account.approver = Some(crate::accounts::ApproverConfig {
+            command: script.display().to_string(),
+            args: Vec::new(),
+            timeout_secs: Some(10),
+        });
+        let load = || {
+            load_keypair_bytes_from_account_with_intent_and_override(
+                &account,
+                "default",
+                MAINNET_NETWORK,
+                &AuthIntent::default_payment(),
+                Some(Box::new(AllowAuth)),
+            )
+        };
+
+        write_approver(1);
+        let err = load().unwrap_err();
+        assert!(
+            matches!(err, Error::PaymentRejected(_)),
+            "caller yes, approver no: {err}"
+        );
+
+        write_approver(0);
+        assert_eq!(&*load().unwrap(), &expected, "both yes");
     }
 
     #[test]

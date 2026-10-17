@@ -49,8 +49,11 @@ hardware wallet is local but not exportable.
   backend. `pay account export` and the export offer in `pay account destroy`
   both go through it.
 - **Approval.** `Gate::for_policy(auth_required, account.approval_override(override))`
-  picks the gate: a caller-supplied override (MCP elicitation), else the
-  account's external `approver`, else the platform prompt, else nothing. `LocalKeystoreBackend::keystore` places it in front of the
+  picks the gate. Without an external `approver`: a caller-supplied override
+  (MCP elicitation, a tenant's spend policy), else the platform prompt, else
+  nothing. With one, the approver is always asked: alone in place of the
+  platform prompt, or after the caller's override, and both must approve.
+  `LocalKeystoreBackend::keystore` places the gate in front of the
   secret store. The file backend composes the platform prompt itself; 1Password
   ignores the gate because `op` prompts.
 - **Platform `cfg`.** Only inside `backend/local.rs`, one block per store,
@@ -109,10 +112,15 @@ cannot start, is killed, or does not answer within `timeout_secs` (it is
 then killed and reaped, along with any helpers it started on Unix; the
 timeout also covers delivering the request). On Unix, anything the approver
 leaves running in its process group is killed once it answers, so it should
-hand longer work to a separate service. The approver replaces the platform
-prompt only when the caller brings no gate of its own, it is only consulted
-when `auth_required` applies, and it lives in `accounts.yml` next to
-`auth_required`, so it is never weaker than turning auth off. A minimal
+hand longer work to a separate service.
+
+The approver can't be skipped. It replaces the platform prompt, and when the
+caller brings a gate of its own (MCP elicitation, a tenant's spend policy),
+both must approve: the caller is asked first, and if it says no, the approver
+is not asked at all. This matters on a headless host, where the MCP client
+answering an elicitation can be the agent itself. The approver is only
+consulted when `auth_required` applies, and it lives in `accounts.yml` next
+to `auth_required`, so it is never weaker than turning auth off. A minimal
 approver that approves single payments up to $1 and denies everything else:
 
 ```sh
@@ -135,6 +143,18 @@ the example then denies everything rather than approving.
   can edit `accounts.yml` (or remove the approver), replace the approver
   program, or read a file keystore directly. Run the agent as a separate user
   or in a container that cannot write those files.
+- **Whoever launches pay controls it.** The process that starts pay sets its
+  environment and working directory. It can point pay at a different
+  `accounts.yml` (found through `HOME`), change its settings (`PAY_CONFIG`,
+  a `pay.toml` in the working directory, other `PAY_*` variables), or load
+  code into pay itself with `LD_PRELOAD`. So pay must also be launched by
+  something the agent cannot control, for example a system service running
+  as another user, not by the agent.
+- **The approver file is not checked for who can write it.** If the agent's
+  user can modify the approver program or a directory above it, it can
+  replace the approver. Keep it in a directory only root or the owner can
+  write. A possible follow-up is to refuse such a file, like ssh's
+  `StrictModes`.
 - **An approval is not bound to the exact transaction.** The request
   describes the action (kind, amount, whether it recurs), but carries no
   recipient, mint or transaction digest, so the approver cannot check that
