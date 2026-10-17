@@ -555,8 +555,12 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(PROBE_OUT, &out)
+            // glibc only warns about a missing LD_PRELOAD library and runs
+            // the probe anyway. DYLD_INSERT_LIBRARIES is left out: macOS
+            // aborts a process whose inserted library is missing, so the
+            // probe would never run. env_clear() drops it like any other
+            // variable, which the rest of this test covers.
             .env("LD_PRELOAD", "/nonexistent/evil.so")
-            .env("DYLD_INSERT_LIBRARIES", "/nonexistent/evil.dylib")
             .env("PATH", format!("{}:/usr/bin:/bin", planted.display()))
             .env("HOME", &planted)
             .env("LANG", "/tmp/evil-locale")
@@ -574,11 +578,7 @@ mod tests {
                 .find_map(|l| l.strip_prefix(&format!("{name}=")))
                 .map(str::to_owned)
         };
-        for name in [
-            "LD_PRELOAD",
-            "DYLD_INSERT_LIBRARIES",
-            "PAY_TEST_REMOTE_WALLET_SECRET",
-        ] {
+        for name in ["LD_PRELOAD", "PAY_TEST_REMOTE_WALLET_SECRET"] {
             assert_eq!(var(name), None, "{name} reached the approver");
         }
         assert!(
