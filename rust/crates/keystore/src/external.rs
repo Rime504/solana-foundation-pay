@@ -8,8 +8,10 @@
 //! anything else denies.
 //!
 //! The gate fails closed. A program that cannot start, exits non-zero, is
-//! killed by a signal or does not answer within the timeout is a denial, and
-//! a timed-out program is killed and reaped so it cannot keep a request open.
+//! killed by a signal or does not answer within the timeout is a denial. The
+//! timeout covers delivering the request as well as the answer, and a
+//! timed-out program is killed and reaped, along with any helpers it started
+//! on Unix, so it cannot keep a request open.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,15 +62,69 @@ impl ExternalApprover {
         self.program.display().to_string()
     }
 
-    fn wait_bounded(&self, child: &mut Child) -> Result<ExitStatus> {
-        let deadline = Instant::now() + self.timeout;
+    /// Run the approver on `request` and decide from its exit status.
+    fn run(&self, request: Vec<u8>) -> Result<()> {
+        // Checked before spawning, so a timeout too large to represent never
+        // starts a program it could not bound.
+        let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
+            Error::AuthDenied(format!(
+                "approver `{}` timeout of {}s is too large",
+                self.name(),
+                self.timeout.as_secs()
+            ))
+        })?;
+
+        let mut command = Command::new(&self.program);
+        command
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        // Its own process group, so a timeout can kill helpers it started too.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command.spawn().map_err(|e| {
+            Error::AuthDenied(format!("approver `{}` could not start: {e}", self.name()))
+        })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            // Written on its own thread so the deadline also covers delivery:
+            // an approver that holds stdin open without reading cannot stall
+            // us on a full pipe. Killing it closes the pipe and ends the
+            // thread. An approver may decide without reading the request; a
+            // closed pipe is not an error, its exit status still decides.
+            let writer = std::thread::Builder::new()
+                .name("pay-approver-stdin".into())
+                .spawn(move || {
+                    let _ = stdin.write_all(&request);
+                });
+            if let Err(e) = writer {
+                kill_tree(&mut child);
+                return Err(Error::AuthDenied(format!(
+                    "approver `{}` could not be sent the request: {e}",
+                    self.name()
+                )));
+            }
+        }
+
+        let status = self.wait_until(&mut child, deadline)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::AuthDenied(format!(
+                "approver `{}` declined ({status})",
+                self.name()
+            )))
+        }
+    }
+
+    fn wait_until(&self, child: &mut Child, deadline: Instant) -> Result<ExitStatus> {
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(status);
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(child);
                 return Err(Error::AuthDenied(format!(
                     "approver `{}` did not answer within {}s",
                     self.name(),
@@ -80,33 +136,23 @@ impl ExternalApprover {
     }
 }
 
+/// Kill the approver and every process in its group, then reap it.
+fn kill_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: kill(2) takes no pointers. The child is not reaped yet, so
+        // its pid, and the process group it leads, cannot have been reused.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl AuthGate for ExternalApprover {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
-        let mut child = Command::new(&self.program)
-            .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| {
-                Error::AuthDenied(format!("approver `{}` could not start: {e}", self.name()))
-            })?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            // An approver may decide without reading the request; a closed
-            // pipe is not an error, its exit status still decides.
-            let _ = stdin.write_all(Self::request_json(intent).as_bytes());
-        }
-
-        let status = self.wait_bounded(&mut child)?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(Error::AuthDenied(format!(
-                "approver `{}` declined ({status})",
-                self.name()
-            )))
-        }
+        self.run(Self::request_json(intent).into_bytes())
     }
 
     fn is_available(&self) -> bool {
@@ -205,13 +251,73 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
 
         let pid = std::fs::read_to_string(&pid_file).unwrap();
-        let alive = Command::new("kill")
-            .args(["-0", pid.trim()])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        assert!(!alive, "timed-out approver must be killed");
+        assert!(gone(pid.trim()), "timed-out approver must be killed");
+    }
+
+    #[test]
+    fn timeout_kills_helpers_the_approver_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("helper-pid");
+        // No `exec`: the shell waits on a separate helper process.
+        let body = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let approver = gate(script(&dir, "helper.sh", &body), Duration::from_millis(300));
+
+        let err = approver.authenticate(&payment()).unwrap_err();
+        assert!(matches!(err, Error::AuthDenied(m) if m.contains("did not answer")));
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            gone(pid.trim()),
+            "helper of a timed-out approver must be killed"
+        );
+    }
+
+    #[test]
+    fn timeout_covers_a_request_the_approver_never_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        // Holds stdin open and never reads it, so a large request fills the pipe.
+        let approver = gate(
+            script(&dir, "deaf.sh", "exec sleep 30"),
+            Duration::from_millis(300),
+        );
+
+        let started = Instant::now();
+        let err = approver.run(vec![b'x'; 4 << 20]).unwrap_err();
+        assert!(matches!(err, Error::AuthDenied(m) if m.contains("did not answer")));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn oversized_timeout_denies_without_starting_the_approver() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let body = format!("touch {}; exit 0", marker.display());
+        let approver = gate(script(&dir, "never.sh", &body), Duration::MAX);
+
+        let err = approver.authenticate(&payment()).unwrap_err();
+        assert!(matches!(err, Error::AuthDenied(m) if m.contains("too large")));
+        assert!(!marker.exists(), "approver must not start");
+    }
+
+    /// Whether `pid` is gone within a couple of seconds. A killed helper is
+    /// reparented and reaped by init, which is not instant.
+    fn gone(pid: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

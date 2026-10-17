@@ -96,9 +96,10 @@ when the action moves no money. `kind` is one of `authorize_payment`,
 
 Exit status `0` approves. Anything else denies, and so does a program that
 cannot start, is killed, or does not answer within `timeout_secs` (it is
-then killed and reaped). The approver replaces the platform prompt only when
-the caller brings no gate of its own, it is only consulted when
-`auth_required` applies, and it lives in `accounts.yml` next to
+then killed and reaped, along with any helpers it started on Unix; the
+timeout also covers delivering the request). The approver replaces the
+platform prompt only when the caller brings no gate of its own, it is only
+consulted when `auth_required` applies, and it lives in `accounts.yml` next to
 `auth_required`, so it is never weaker than turning auth off. A minimal
 approver that approves single payments up to $1 and denies everything else:
 
@@ -106,6 +107,7 @@ approver that approves single payments up to $1 and denies everything else:
 #!/bin/sh
 req=$(cat)
 [ "$(printf '%s' "$req" | jq -r .kind)" = authorize_payment ] || exit 1
+printf '%s' "$req" | jq -e '.recurring == false' >/dev/null || exit 1
 [ "$(printf '%s' "$req" | jq -r '.amount_minor_units // 99999999')" -le 10000 ]
 ```
 
